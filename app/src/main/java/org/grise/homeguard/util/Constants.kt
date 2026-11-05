@@ -20,7 +20,22 @@ object Constants {
     
     // Notification
     const val NOTIFICATION_CHANNEL_ID = "active"
+    const val ALERT_CHANNEL_ID = "alerts"
     const val NOTIFICATION_ID = 1
+    const val ATTENTION_NOTIFICATION_ID = 2
+
+    // Power / keep awake
+    const val CPU_WAKE_LOCK_TAG = "HomeGuard::MonitoringEngine"
+    const val WIFI_WAKE_LOCK_TAG = "HomeGuard::MonitoringWifi"
+    const val BOOT_WAKE_LOCK_TAG = "HomeGuard::BootResume"
+    const val BOOT_WAKE_LOCK_TIMEOUT_MS = 30_000L
+
+    // Diagnostics: one heartbeat log per HEARTBEAT_TICKS iterations of the 1s check loop
+    const val HEARTBEAT_TICKS = 60L
+
+    // Engine restart backoff
+    const val ENGINE_RETRY_MIN_DELAY_SECONDS = 5L
+    const val ENGINE_RETRY_MAX_DELAY_SECONDS = 60L
     
     // Memory
     const val MAX_LOGS_COUNT = 50
