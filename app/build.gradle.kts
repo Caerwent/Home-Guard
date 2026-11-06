@@ -37,6 +37,13 @@ android {
     buildFeatures {
         compose = true
     }
+
+    testOptions {
+        // MotionThresholdTest asserts on SensorManager.GRAVITY_EARTH, a real framework constant.
+        // Without this the android.jar stubs return 0 for every framework call and the assertions
+        // would pass against a meaningless value.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -62,6 +69,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.service)
 
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)

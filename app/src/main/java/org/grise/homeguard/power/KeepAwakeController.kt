@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import org.grise.homeguard.util.Constants
 
@@ -45,6 +46,23 @@ class KeepAwakeController(context: Context) {
     val isCpuWakeLockHeld: Boolean get() = cpuWakeLock.isHeld
     val isWifiWakeLockHeld: Boolean get() = wifiWakeLock?.isHeld == true
 
+    /**
+     * Wall time accumulated while the Wi-Fi lock was held, plus the currently open interval.
+     *
+     * The full-power Wi-Fi lock keeps the radio out of its power-save states, so the fraction of
+     * the monitoring session spent holding it is what determines whether releasing it between
+     * scheduled captures is worth the sync reconnects that would follow. Reported by the engine
+     * heartbeat so that trade-off can be measured instead of estimated.
+     */
+    val wifiLockHeldDurationMs: Long
+        get() {
+            val open = wifiLockAcquiredAt?.let { SystemClock.elapsedRealtime() - it } ?: 0L
+            return wifiLockHeldMs + open
+        }
+
+    private var wifiLockHeldMs = 0L
+    private var wifiLockAcquiredAt: Long? = null
+
     fun acquire() {
         try {
             if (!cpuWakeLock.isHeld) cpuWakeLock.acquire()
@@ -53,7 +71,10 @@ class KeepAwakeController(context: Context) {
         }
 
         try {
-            if (wifiWakeLock?.isHeld != true) wifiWakeLock?.acquire()
+            if (wifiWakeLock?.isHeld != true) {
+                wifiWakeLock?.acquire()
+                wifiLockAcquiredAt = SystemClock.elapsedRealtime()
+            }
         } catch (e: Exception) {
             Log.e(Constants.TAG, "Unable to acquire the Wi-Fi wake lock", e)
         }
@@ -73,7 +94,11 @@ class KeepAwakeController(context: Context) {
         }
 
         try {
-            if (wifiWakeLock?.isHeld == true) wifiWakeLock.release()
+            if (wifiWakeLock?.isHeld == true) {
+                wifiWakeLock.release()
+                wifiLockAcquiredAt?.let { wifiLockHeldMs += SystemClock.elapsedRealtime() - it }
+                wifiLockAcquiredAt = null
+            }
         } catch (e: Exception) {
             Log.w(Constants.TAG, "Unable to release the Wi-Fi wake lock", e)
         }

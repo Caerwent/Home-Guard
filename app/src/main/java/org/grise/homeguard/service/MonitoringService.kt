@@ -20,6 +20,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ChannelResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -42,9 +44,11 @@ import org.grise.homeguard.matrix.MatrixManager
 import org.grise.homeguard.notification.AppNotifications
 import org.grise.homeguard.power.KeepAwakeController
 import org.grise.homeguard.util.Constants
+import org.grise.homeguard.util.ReentrantMutex
+import org.grise.homeguard.util.gForceChangeOf
+import org.grise.homeguard.util.isMotion
+import org.grise.homeguard.util.shouldCaptureInBurst
 import java.io.File
-import kotlin.math.abs
-import kotlin.math.sqrt
 import kotlin.system.measureTimeMillis
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
@@ -128,42 +132,91 @@ class MonitoringService : LifecycleService() {
     private val alarmMutex = Mutex()
     private val cameraFailureCount = mutableMapOf<String, Int>()
 
-    private var isRecording = false
+    /**
+     * Serialises every capture (timed, motion, or remote `!picture`) against every other one.
+     * Motion used to be discovered by polling `motionFlag` from the 1s loop, which made capture
+     * implicitly single-threaded. Now that the sensor callback dispatches directly, two triggers
+     * can genuinely overlap, so the exclusivity has to be explicit.
+     */
+    private val captureMutex = ReentrantMutex()
+
+    @Volatile
     private var isMotionSequenceActive = false
+
+    /** Wall-clock instant of the last accepted motion trigger, used to anchor the cooldown. */
+    @Volatile
     private var lastMotionTimestamp = 0L
+
+    /**
+     * Motion is dispatched from the sensor callback into this channel, and consumed by
+     * [startMotionCollector]. Conflated: while a burst is already being captured, later triggers
+     * only need to signal "more motion happened", they must not queue up extra sequences.
+     */
+    private val motionChannel = Channel<Unit>(Channel.CONFLATED)
+
+    private var motionJob: Job? = null
 
     private val sensorManager: SensorManager by lazy {
         getSystemService(SENSOR_SERVICE) as SensorManager
     }
 
+    /**
+     * Runs on the sensor thread and must not block or suspend: it only records the trigger and
+     * nudges [motionChannel]. The capture itself happens in [startMotionCollector].
+     *
+     * There is deliberately no `isMotionSequenceActive` guard here. Dropping triggers while a
+     * sequence runs used to truncate the burst, because the collector decides how long to keep
+     * shooting from [lastMotionTimestamp]; ignoring an update would make it stop early.
+     */
     private val motionListener = object : SensorEventListener {
         override fun onSensorChanged(event: SensorEvent?) {
-            if (event == null || isRecording || isMotionSequenceActive) return
+            if (event == null) return
 
             val x = event.values[0]
             val y = event.values[1]
             val z = event.values[2]
 
-            val magnitude = sqrt((x * x + y * y + z * z).toDouble()).toFloat()
-            val gForceChange = abs(magnitude - SensorManager.GRAVITY_EARTH)
+            val gForceChange = gForceChangeOf(x, y, z)
 
-            if (gForceChange > motionThreshold) {
-                if (!motionFlag) {
-                    Log.i(Constants.TAG, "Motion detected! G-Force Change: $gForceChange")
+            if (isMotion(gForceChange, motionThreshold)) {
+                // The sensor is batched (see registerMotionListener), so events are delivered in
+                // bursts with past timestamps: derive the real instant from the event itself
+                // instead of System.currentTimeMillis(), otherwise the cooldown window drifts.
+                lastMotionTimestamp = wallClockOf(event)
+                if (!isMotionSequenceActive) {
+                    Log.i(
+                        Constants.TAG,
+                        "Motion detected (g-force change $gForceChange), dispatching capture"
+                    )
                 }
-                motionFlag = true
-                lastMotionTimestamp = System.currentTimeMillis()
+                // trySend never blocks, which is what makes it safe on the sensor callback thread.
+                motionChannel.trySend(Unit)
             }
         }
 
         override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
     }
 
-    @Volatile
-    private var motionFlag = false
+    /** Converts a [SensorEvent.timestamp] (elapsedRealtimeNanos) to wall-clock milliseconds. */
+    private fun wallClockOf(event: SensorEvent): Long =
+        System.currentTimeMillis() -
+                (SystemClock.elapsedRealtimeNanos() - event.timestamp) / 1_000_000L
 
     @Volatile
     private var motionThreshold = Constants.MOTION_THRESHOLD_DEFAULT
+
+    /** Whether the accelerometer listener is currently registered, so we toggle it only on change. */
+    @Volatile
+    private var motionListenerRegistered = false
+
+    /**
+     * Latest settings, refreshed by [startSettingsWatcher] so the 1s check loop no longer reads and
+     * decodes the DataStore 86 400 times a day for values that almost never change.
+     */
+    @Volatile
+    private var latestSettings: AppSettings = AppSettings()
+
+    private var settingsJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -199,8 +252,11 @@ class MonitoringService : LifecycleService() {
         _powerGuard.value = PowerGuard()
 
         notificationJob?.cancel()
+        settingsJob?.cancel()
+        motionJob?.cancel()
         engineJob?.cancel()
         serviceScope.cancel()
+        motionChannel.close()
 
         try {
             sensorManager.unregisterListener(motionListener)
@@ -295,6 +351,9 @@ class MonitoringService : LifecycleService() {
         }
 
         motionThreshold = settings.motionThreshold
+        latestSettings = settings
+        startSettingsWatcher()
+        startMotionCollector()
         startNotificationUpdater()
 
         MatrixManager.login(
@@ -317,55 +376,28 @@ class MonitoringService : LifecycleService() {
         )
 
         val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        var currentMotionEnabled = false
         var ticks = 0L
         val startUptime = SystemClock.uptimeMillis()
         val startElapsed = SystemClock.elapsedRealtime()
 
         try {
-            if (settings.isMotionDetectionEnabled) {
-                registerMotionListener(accelerometer)
-                currentMotionEnabled = true
-            }
+            // Settings reactions (enable/disable, threshold) are driven by startSettingsWatcher,
+            // which observes the DataStore StateFlow and therefore reacts immediately. This loop is
+            // only a watchdog plus the heartbeat, so it no longer carries any latency budget.
+            applyMotionDetectionSetting(settings.isMotionDetectionEnabled, accelerometer)
 
             while (currentCoroutineContext().isActive) {
                 delay(Constants.MONITORING_CHECK_INTERVAL)
                 ticks++
 
                 if (ticks % Constants.HEARTBEAT_TICKS == 0L) {
-                    // uptimeMillis() stops advancing while the CPU is suspended, elapsedRealtime()
-                    // does not: their difference is exactly how long the device was asleep, which is
-                    // what used to freeze the capture loop.
-                    val suspended = (SystemClock.elapsedRealtime() - startElapsed) -
-                            (SystemClock.uptimeMillis() - startUptime)
-                    Log.i(
-                        Constants.TAG,
-                        "Engine heartbeat: ticks=$ticks, asleep=${suspended}ms, " +
-                                "nextPhoto=${MatrixManager.remainingTime.value}s, " +
-                                "cpu=${keepAwake.isCpuWakeLockHeld}, wifi=${keepAwake.isWifiWakeLockHeld}"
-                    )
+                    logHeartbeat(ticks, startUptime, startElapsed)
                 }
 
-                val currentSettings = dataStore.settings.first()
-                if (!currentSettings.isMonitoringEnabled) {
+                if (!latestSettings.isMonitoringEnabled) {
                     Log.d(Constants.TAG, "Engine: monitoring disabled by user, stopping")
                     stopSelf()
                     break
-                }
-                motionThreshold = currentSettings.motionThreshold
-
-                if (currentSettings.isMotionDetectionEnabled != currentMotionEnabled) {
-                    currentMotionEnabled = currentSettings.isMotionDetectionEnabled
-                    if (currentMotionEnabled) {
-                        registerMotionListener(accelerometer)
-                    } else {
-                        sensorManager.unregisterListener(motionListener)
-                    }
-                }
-
-                if (motionFlag && !isRecording && !isMotionSequenceActive) {
-                    motionFlag = false
-                    captureMotionSequence(currentSettings)
                 }
             }
         } finally {
@@ -377,18 +409,163 @@ class MonitoringService : LifecycleService() {
         }
     }
 
+    /**
+     * Heartbeat diagnostics. Besides the sleep-time and wake-lock state, this reports the two
+     * numbers needed to size the deferred "adaptive Wi-Fi lock" optimisation: how long the radio
+     * lock has been held, and how often sync had to be re-established.
+     */
+    private fun logHeartbeat(ticks: Long, startUptime: Long, startElapsed: Long) {
+        // uptimeMillis() stops advancing while the CPU is suspended, elapsedRealtime() does not:
+        // their difference is exactly how long the device was asleep, which is what used to freeze
+        // the capture loop.
+        val suspended = (SystemClock.elapsedRealtime() - startElapsed) -
+                (SystemClock.uptimeMillis() - startUptime)
+        Log.i(
+            Constants.TAG,
+            "Engine heartbeat: ticks=$ticks, asleep=${suspended}ms, " +
+                    "nextPhoto=${MatrixManager.remainingTime.value}s, " +
+                    "cpu=${keepAwake.isCpuWakeLockHeld}, wifi=${keepAwake.isWifiWakeLockHeld}, " +
+                    "wifiHeld=${keepAwake.wifiLockHeldDurationMs}ms, " +
+                    "syncReconnects=${MatrixManager.syncReconnectCount.value}"
+        )
+    }
+
+    /**
+     * Consumes motion triggers dispatched by [motionListener] on the sensor thread.
+     *
+     * Because the trigger is delivered here as soon as the sensor callback fires, the time between
+     * the device moving and the first photo is bounded by coroutine scheduling instead of the
+     * polling interval that used to sit in front of it.
+     */
+    private fun startMotionCollector() {
+        if (motionJob?.isActive == true) return
+
+        motionJob = serviceScope.launch {
+            while (isActive) {
+                val delivered: ChannelResult<Unit> = motionChannel.receiveCatching()
+                if (delivered.isClosed) break
+                // The channel is conflated, so at most one trigger is pending. Drain the extras
+                // that piled up while the previous sequence was running before deciding to capture.
+                while (motionChannel.tryReceive().isSuccess) {
+                    // Intentionally empty: the payload carries no data, only "motion happened".
+                }
+
+                if (!latestSettings.isMonitoringEnabled) continue
+
+                // Measured here rather than inside the capture so it reflects trigger-to-start
+                // latency, which is the budget that actually matters for "motion photo < 1s".
+                val latency = System.currentTimeMillis() - lastMotionTimestamp
+                if (latency > Constants.MOTION_DISPATCH_LATENCY_BUDGET_MS) {
+                    Log.w(
+                        Constants.TAG,
+                        "Motion dispatch latency ${latency}ms exceeds the " +
+                                "${Constants.MOTION_DISPATCH_LATENCY_BUDGET_MS}ms budget"
+                    )
+                } else if (latency > Constants.MOTION_DISPATCH_LATENCY_LOG_MS) {
+                    Log.i(Constants.TAG, "Motion dispatch latency ${latency}ms")
+                }
+
+                runMotionSequence(latestSettings)
+            }
+        }
+    }
+
+    /**
+     * Captures until [Constants.MOTION_COOLDOWN_MS] after the last motion trigger.
+     *
+     * The window is anchored on the instant the burst is picked up, and extended while
+     * [motionListener] keeps reporting movement. Previously the window was compared against a
+     * timestamp observed at the polling boundary, so a burst that ended just after a tick could
+     * find the condition already false on entry and capture nothing at all.
+     */
+    private suspend fun runMotionSequence(settings: AppSettings) {
+        if (!settings.isMotionDetectionEnabled) return
+
+        captureMutex.withLock {
+            val burstStart = System.currentTimeMillis()
+            val triggeredAt = lastMotionTimestamp
+            isMotionSequenceActive = true
+            Log.i(Constants.TAG, "Starting motion capture sequence")
+            try {
+                while (shouldCaptureInBurst(
+                        nowMs = System.currentTimeMillis(),
+                        lastMotionMs = lastMotionTimestamp,
+                        cooldownMs = Constants.MOTION_COOLDOWN_MS,
+                        elapsedSinceStartMs = System.currentTimeMillis() - burstStart,
+                    )
+                ) {
+                    // performTimedCapture re-enters captureMutex on this same coroutine, so the
+                    // burst holds it for its whole duration and no other trigger can interleave.
+                    performTimedCapture(settings, includeBattery = false)
+                    delay(Constants.MOTION_CAPTURE_DELAY)
+                }
+            } finally {
+                isMotionSequenceActive = false
+                Log.i(
+                    Constants.TAG,
+                    "Motion sequence finished (last trigger ${System.currentTimeMillis() - triggeredAt}ms before end)"
+                )
+            }
+        }
+    }
+
+    /**
+     * Starts or stops the accelerometer to match [enabled]. Idempotent, and safe to call from both
+     * the startup path and the settings collector.
+     */
+    private fun applyMotionDetectionSetting(enabled: Boolean, accelerometer: Sensor?) {
+        if (enabled == motionListenerRegistered) return
+        motionListenerRegistered = enabled
+        if (enabled) {
+            registerMotionListener(accelerometer)
+        } else {
+            try {
+                sensorManager.unregisterListener(motionListener)
+            } catch (e: Exception) {
+                Log.w(Constants.TAG, "Unable to unregister the sensor listener", e)
+            }
+            Log.i(Constants.TAG, "Engine: motion detection disabled")
+        }
+    }
+
     private fun registerMotionListener(accelerometer: Sensor?) {
         if (accelerometer == null) {
             Log.w(Constants.TAG, "Engine: no accelerometer available for motion detection")
             return
         }
-        motionFlag = false
+        // maxReportLatencyUs lets the hardware FIFO batch the samples, so the AP is woken once a
+        // second instead of every 200ms. Nothing is lost: the loop only needs the peak deviation
+        // within the last second, and each event still carries its own timestamp.
         sensorManager.registerListener(
             motionListener,
             accelerometer,
-            SensorManager.SENSOR_DELAY_NORMAL
+            SensorManager.SENSOR_DELAY_NORMAL,
+            /* maxReportLatencyUs = */ Constants.MOTION_SENSOR_BATCH_US.toInt()
         )
-        Log.i(Constants.TAG, "Engine: motion detection enabled (${accelerometer.name})")
+        motionListenerRegistered = true
+        Log.i(Constants.TAG, "Engine: motion detection enabled (${accelerometer.name}, batched)")
+    }
+
+    /**
+     * Keeps [latestSettings] hot and reacts to changes as they happen.
+     *
+     * The DataStore already exposes settings as a `StateFlow`, so it emits on every write. The check
+     * loop used to re-read those values once a second anyway, which added up to 86 400 redundant
+     * reads a day and made every setting change up to a second late. Reacting here is both cheaper
+     * and immediate.
+     */
+    private fun startSettingsWatcher() {
+        if (settingsJob?.isActive == true) return
+
+        val accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
+
+        settingsJob = serviceScope.launch {
+            dataStore.settings.collect { settings ->
+                latestSettings = settings
+                motionThreshold = settings.motionThreshold
+                applyMotionDetectionSetting(settings.isMotionDetectionEnabled, accelerometer)
+            }
+        }
     }
 
     private fun startNotificationUpdater() {
@@ -419,21 +596,14 @@ class MonitoringService : LifecycleService() {
         return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%02d:%02d".format(m, s)
     }
 
-    private suspend fun captureMotionSequence(settings: AppSettings) {
-        isMotionSequenceActive = true
-        Log.i(Constants.TAG, "Starting motion capture sequence")
-        try {
-            while (System.currentTimeMillis() - lastMotionTimestamp < Constants.MOTION_COOLDOWN_MS) {
-                performTimedCapture(settings, includeBattery = false)
-                delay(Constants.MOTION_CAPTURE_DELAY)
-            }
-        } finally {
-            isMotionSequenceActive = false
-            Log.i(Constants.TAG, "Motion sequence finished")
-        }
+    private suspend fun performTimedCapture(settings: AppSettings, includeBattery: Boolean = true) {
+        // Reentrant: a motion burst already holds this lock for the duration of the sequence, while
+        // a remote `!picture` arrives holding nothing. Either way only one capture touches the
+        // camera at a time.
+        captureMutex.withLock { performCapture(settings, includeBattery) }
     }
 
-    private suspend fun performTimedCapture(settings: AppSettings, includeBattery: Boolean = true) {
+    private suspend fun performCapture(settings: AppSettings, includeBattery: Boolean) {
         val labeledFiles = mutableListOf<Pair<File, String>>()
         val failedCameras = mutableListOf<String>()
 
