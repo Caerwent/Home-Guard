@@ -37,6 +37,13 @@ android {
     buildFeatures {
         compose = true
     }
+
+    testOptions {
+        // MotionThresholdTest asserts on SensorManager.GRAVITY_EARTH, a real framework constant.
+        // Without this the android.jar stubs return 0 for every framework call and the assertions
+        // would pass against a meaningless value.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -48,10 +55,10 @@ dependencies {
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.material.icons.extended)
     implementation(libs.androidx.datastore.preferences)
-    implementation(libs.androidx.work.runtime.ktx)
     implementation(libs.trixnity.client)
     implementation(libs.trixnity.crypto.vodozemac)
     implementation(libs.ktor.client.okhttp)
@@ -60,7 +67,9 @@ dependencies {
     implementation(libs.androidx.camera.video)
     implementation(libs.androidx.camera.view)
     implementation(libs.androidx.lifecycle.service)
+
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)

@@ -70,8 +70,21 @@ object MatrixManager {
     private val _remainingTime = MutableStateFlow(0L)
     val remainingTime: StateFlow<Long> = _remainingTime.asStateFlow()
 
+    /**
+     * Seconds since monitoring started, for the monitoring screen. Display-only, so it advances in
+     * [Constants.ELAPSED_TICK_SECONDS] steps rather than the 86 400 times a day it used to; nothing
+     * schedules work off this value.
+     */
     private val _elapsedTime = MutableStateFlow(0L)
     val elapsedTime: StateFlow<Long> = _elapsedTime.asStateFlow()
+
+    /**
+     * How many times the sync loop had to be restarted. Together with the Wi-Fi lock hold time in
+     * the engine heartbeat, this is the evidence needed to decide whether releasing the Wi-Fi lock
+     * between scheduled captures is affordable.
+     */
+    private val _syncReconnectCount = MutableStateFlow(0)
+    val syncReconnectCount: StateFlow<Int> = _syncReconnectCount.asStateFlow()
 
     private val _currentInterval = MutableStateFlow(0)
     val currentInterval: StateFlow<Int> = _currentInterval.asStateFlow()
@@ -99,11 +112,13 @@ object MatrixManager {
         alarmProvider = onAlarm
         _elapsedTime.value = 0
         
+        _syncReconnectCount.value = 0
+
         sessionJob = scope.launch {
             launch {
                 while (isActive) {
-                    delay(Constants.MONITORING_CHECK_INTERVAL)
-                    _elapsedTime.value += 1
+                    delay(Constants.ELAPSED_TICK_SECONDS.seconds)
+                    _elapsedTime.value += Constants.ELAPSED_TICK_SECONDS
                 }
             }
             try {
@@ -145,6 +160,7 @@ object MatrixManager {
                 autoJoinRoom(client!!, rid)
 
                 var syncStarted = false
+                var wasConnected = false
                 launch {
                     client?.syncState?.collect { state ->
                         Log.d(Constants.TAG, "Sync state changed: $state")
@@ -153,11 +169,19 @@ object MatrixManager {
                             addLog("Sync active")
                             listRooms(client!!)
                         }
-                        _connectionState.value = state in listOf(
+                        val connected = state in listOf(
                             SyncState.STARTED,
                             SyncState.INITIAL_SYNC,
                             SyncState.RUNNING
                         )
+                        // Count drop-and-recover transitions, which is what a released Wi-Fi lock
+                        // would add. TIMEOUT and ERROR are the states the long-poll falls into when
+                        // the radio has been powered down or idle-mode filtering killed the socket.
+                        if (wasConnected && (state == SyncState.TIMEOUT || state == SyncState.ERROR)) {
+                            _syncReconnectCount.value += 1
+                        }
+                        wasConnected = connected
+                        _connectionState.value = connected
                     }
                 }
                 

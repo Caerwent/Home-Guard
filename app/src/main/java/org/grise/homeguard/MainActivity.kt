@@ -25,8 +25,8 @@ import org.grise.homeguard.ui.screens.SettingsScreen
 import org.grise.homeguard.ui.screens.MonitoringScreen
 import org.grise.homeguard.ui.theme.HomeGuardTheme
 import org.grise.homeguard.viewmodel.SettingsViewModel
+import org.grise.homeguard.service.MonitoringService
 import org.grise.homeguard.viewmodel.MonitoringViewModel
-import org.grise.homeguard.worker.MonitoringWorker
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -64,10 +64,11 @@ fun AppNav(nav: NavHostController) {
     val svm: SettingsViewModel = viewModel(factory = factory)
     val mvm: MonitoringViewModel = viewModel(factory = factory)
     val s by svm.settings.collectAsState()
+    val serviceRunning by mvm.isServiceRunning.collectAsState()
 
     val activity = ctx as? ComponentActivity
     LaunchedEffect(activity?.intent) {
-        if (activity?.intent?.action == MonitoringWorker.ACTION_SHOW_MONITORING) {
+        if (activity?.intent?.action == MonitoringService.ACTION_SHOW_MONITORING) {
             nav.navigate("monitoring")
             activity.intent.action = null
         }
@@ -80,7 +81,8 @@ fun AppNav(nav: NavHostController) {
                 onOpenSettings = { nav.navigate("settings") },
                 onStart = { mvm.startMonitoring() },
                 isConfigured = s.isConfigured(),
-                isMonitoringActive = s.isMonitoringEnabled
+                isMonitoringEnabled = s.isMonitoringEnabled,
+                isServiceRunning = serviceRunning
             )
         }
         composable("settings") {

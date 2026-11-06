@@ -26,6 +26,8 @@ fun MonitoringScreen(onStop: () -> Unit, viewModel: MonitoringViewModel) {
     val currentInterval by viewModel.currentInterval.collectAsState()
     val connected by viewModel.isMatrixConnected.collectAsState()
     val logs by viewModel.logs.collectAsState()
+    val running by viewModel.isServiceRunning.collectAsState()
+    val powerGuard by viewModel.powerGuard.collectAsState()
 
     Scaffold(topBar = {
         TopAppBar(
@@ -47,6 +49,22 @@ fun MonitoringScreen(onStop: () -> Unit, viewModel: MonitoringViewModel) {
                         stringResource(R.string.matrix_status, if (connected) stringResource(R.string.status_connected) else stringResource(R.string.status_disconnected)),
                         style = MaterialTheme.typography.bodyMedium
                     )
+                    Text(
+                        stringResource(
+                            R.string.power_guard_status,
+                            stringResource(if (powerGuard.cpuWakeLock) R.string.status_active else R.string.status_inactive),
+                            stringResource(if (powerGuard.wifiWakeLock) R.string.status_active else R.string.status_inactive),
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    if (!running) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            stringResource(R.string.monitoring_paused_text),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
                 }
             }
             Spacer(Modifier.height(16.dp))
